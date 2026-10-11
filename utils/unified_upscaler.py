@@ -11,6 +11,7 @@ from typing import Union, Optional
 import torchvision.transforms as transforms
 from pathlib import Path
 
+from utils.device import get_device
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -25,7 +26,7 @@ class UnifiedImageUpscaler:
     SUPPORTED_METHODS = ['bilinear', 'bicubic', 'nearest', 'lanczos', 'torch', 'srcnn', 'hybrid']
     
     def __init__(self, device: Optional[torch.device] = None):
-        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = device or get_device()
         logger.info(f"Upscaler initialized on device: {self.device}")
     
     def upscale(self,

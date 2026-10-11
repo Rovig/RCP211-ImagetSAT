@@ -4,6 +4,7 @@ Tests unitaires pour le script generate_image
 """
 
 import unittest
+from pathlib import Path
 import tempfile
 from unittest.mock import patch, Mock, MagicMock
 import argparse
@@ -153,6 +154,15 @@ class TestGenerateImage(unittest.TestCase):
         call_args = self.mock_upscaler_instance.upscale_image.call_args
         expected_output = 'custom_output_upscaled_3x.png'
         self.assertEqual(call_args[0][1], expected_output)
+    
+    @patch('sys.argv', ['generate_image.py', '--output', 'results/custom_output', '--upscale', '2'])
+    def test_upscaled_filename_without_extension(self):
+        """Test du nom de fichier upscalé quand la sortie n'a pas d'extension"""
+        self.mock_generator_instance.generate.return_value = 'results/custom_output'
+        main_simple()
+        
+        call_args = self.mock_upscaler_instance.upscale_image.call_args
+        self.assertEqual(Path(call_args[0][1]), Path('results/custom_output_upscaled_2x'))
     
     @patch('sys.argv', ['generate_image.py', '--help'])
     def test_help_argument(self):

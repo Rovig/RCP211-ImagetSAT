@@ -12,6 +12,7 @@ from typing import Optional
 
 from core.models.model_manager import ModelManager
 from core.generation.environment_styles import EnvironmentStyler
+from utils.device import get_device
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -27,7 +28,7 @@ class SimpleSatelliteGenerator:
         Args:
             checkpoint_path: Chemin vers le checkpoint du modèle
         """
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = get_device()
         self.model_manager = ModelManager()
         self.generator = self.model_manager.load_generator(checkpoint_path, self.device)
         self.styler = EnvironmentStyler()
@@ -48,7 +49,9 @@ class SimpleSatelliteGenerator:
             str: Chemin du fichier généré
         """
         # Création ou chargement de la carte d'entrée
-        if input_map_path and Path(input_map_path).exists():
+        if input_map_path:
+            if not Path(input_map_path).exists():
+                raise FileNotFoundError(f"Carte d'entrée introuvable: {input_map_path}")
             input_map = self._load_and_process_map(input_map_path)
         else:
             logger.info("Création d'une carte aléatoire...")

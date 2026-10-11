@@ -169,16 +169,34 @@ class TestSatelliteGenerator(unittest.TestCase):
         self.assertTrue(0 <= numpy_array.min() <= numpy_array.max() <= 255)
     
     def test_device_selection(self):
-        """Test de la sélection du device (CPU/GPU)"""
-        # Test avec CUDA non disponible
-        with patch('torch.cuda.is_available', return_value=False):
-            generator = SimpleSatelliteGenerator()
-            self.assertEqual(generator.device.type, 'cpu')
+        """Test de la sélection du device (CUDA, puis MPS, puis CPU)"""
+        cases = [
+            (False, False, 'cpu'),
+            (False, True, 'mps'),
+            (True, False, 'cuda'),
+            (True, True, 'cuda'),
+        ]
         
-        # Test avec CUDA disponible
-        with patch('torch.cuda.is_available', return_value=True):
+        for cuda, mps, expected in cases:
+            with self.subTest(cuda=cuda, mps=mps):
+                with patch('torch.cuda.is_available', return_value=cuda), \
+                     patch('torch.backends.mps.is_available', return_value=mps):
+                    generator = SimpleSatelliteGenerator()
+                    self.assertEqual(generator.device.type, expected)
+    
+    def test_generate_with_missing_input_map(self):
+        """Test qu'une carte d'entrée introuvable est une erreur"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "output.png"
+            
             generator = SimpleSatelliteGenerator()
-            self.assertEqual(generator.device.type, 'cuda')
+            with self.assertRaises(FileNotFoundError):
+                generator.generate(
+                    input_map_path=str(Path(tmpdir) / "absente.png"),
+                    output_path=str(output_path)
+                )
+            
+            self.assertFalse(output_path.exists())
     
     def test_generate_different_output_formats(self):
         """Test de génération avec différents formats de sortie"""

@@ -46,6 +46,31 @@ class TestLogger(unittest.TestCase):
             log_files = list(Path(tmpdir).glob('*test.log'))
             self.assertTrue(len(log_files) > 0)
     
+    def test_file_log_has_no_color_codes(self):
+        """Test que les couleurs de la console n'atteignent pas le fichier"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            logger = setup_logger('TEST_NO_COLOR', 'DEBUG', 'test.log', tmpdir)
+            
+            logger.warning("Message d'avertissement")
+            logger.error("Message d'erreur")
+            for handler in logger.handlers:
+                handler.flush()
+            
+            content = list(Path(tmpdir).glob('*test.log'))[0].read_text()
+            
+            self.assertIn("WARNING - Message d'avertissement", content)
+            self.assertIn("ERROR - Message d'erreur", content)
+            self.assertNotIn('\033[', content)
+    
+    def test_colored_formatter_does_not_modify_record(self):
+        """Test que le formatter ne modifie pas le record partagé"""
+        record = logging.LogRecord('test', logging.WARNING, __file__, 1, 'message', None, None)
+        
+        formatted = ColoredFormatter('%(levelname)s - %(message)s').format(record)
+        
+        self.assertIn('\033[', formatted)
+        self.assertEqual(record.levelname, 'WARNING')
+    
     def test_get_logger(self):
         """Test de récupération d'un logger"""
         logger1 = get_logger('TEST_GET')

@@ -26,6 +26,7 @@ import json
 import torch.nn.functional as F
 from sklearn.model_selection import train_test_split
 from core.models.networks import ImprovedGenerator, ImprovedDiscriminator
+from utils.device import get_device
 
 class ImprovedInriaDataset(Dataset):
     """Dataset amélioré avec augmentation de données et meilleure résolution."""
@@ -174,7 +175,7 @@ def calculate_psnr(img1, img2, max_val=1.0):
     """Calcul du PSNR entre deux images."""
     mse = F.mse_loss(img1, img2)
     if mse == 0:
-        return float('inf')
+        return torch.tensor(float('inf'), device=img1.device)
     return 20 * torch.log10(max_val / torch.sqrt(mse))
 
 
@@ -236,22 +237,15 @@ class ImprovedTrainer:
         self.criterion_L1 = nn.L1Loss()
     
     def train_step(self, real_A, real_B):
-        batch_size = real_A.size(0)
-        
-        # Test forward pass pour déterminer la taille de sortie
-        with torch.no_grad():
-            test_out = self.discriminator(real_A[:1], real_B[:1])
-            out_h, out_w = test_out.shape[2], test_out.shape[3]
-        
-        # Labels pour LSGAN (plus stable) - taille adaptative
-        real_label = torch.ones(batch_size, 1, out_h, out_w).to(self.device)
-        fake_label = torch.zeros(batch_size, 1, out_h, out_w).to(self.device)
-        
         # ================== Train Generator ==================
         self.optimizer_G.zero_grad()
         
         fake_B = self.generator(real_A)
         pred_fake = self.discriminator(real_A, fake_B)
+        
+        # Labels pour LSGAN (plus stable) - à la taille de sortie du discriminateur
+        real_label = torch.ones_like(pred_fake)
+        fake_label = torch.zeros_like(pred_fake)
         
         # Losses du générateur
         loss_G_GAN = self.criterion_GAN(pred_fake, real_label)
@@ -324,7 +318,6 @@ class ImprovedTrainer:
             for real_A, real_B in val_loader:
                 real_A = real_A.to(self.device)
                 real_B = real_B.to(self.device)
-                batch_size = real_A.size(0)
                 
                 # Générer les images
                 fake_B = self.generator(real_A)
@@ -333,10 +326,8 @@ class ImprovedTrainer:
                 pred_fake = self.discriminator(real_A, fake_B)
                 pred_real = self.discriminator(real_A, real_B)
                 
-                # Taille de sortie du discriminateur
-                out_h, out_w = pred_fake.shape[2], pred_fake.shape[3]
-                real_label = torch.ones(batch_size, 1, out_h, out_w).to(self.device)
-                fake_label = torch.zeros(batch_size, 1, out_h, out_w).to(self.device)
+                real_label = torch.ones_like(pred_fake)
+                fake_label = torch.zeros_like(pred_fake)
                 
                 loss_g_gan = self.criterion_GAN(pred_fake, real_label)
                 loss_g_l1 = self.criterion_L1(fake_B, real_B) * self.lambda_l1
@@ -363,12 +354,92 @@ class ImprovedTrainer:
         self.generator.train()
         self.discriminator.train()
         
+        if num_batches == 0:
+            raise ValueError("Validation impossible: aucun batch dans val_loader")
+        
         return {
             'val_loss_G': total_loss_g / num_batches,
             'val_loss_D': total_loss_d / num_batches,
             'val_psnr': total_psnr / num_batches,
             'val_ssim': total_ssim / num_batches
         }
+
+
+class TrainingState:
+    """Historique des losses, meilleur modèle et early stopping."""
+    
+    def __init__(self, patience):
+        self.patience = patience
+        self.history = []
+        self.best_val_loss = float('inf')
+        self.best_val_psnr = 0
+        self.best_val_ssim = 0
+        self.best_epoch = 0
+        self.epochs_no_improve = 0
+    
+    def update(self, epoch, val_metrics):
+        """Enregistre une validation. Retourne True si c'est le meilleur modèle."""
+        if val_metrics['val_psnr'] > self.best_val_psnr:
+            self.best_val_psnr = val_metrics['val_psnr']
+            self.best_val_ssim = val_metrics['val_ssim']
+            self.best_val_loss = val_metrics['val_loss_G']
+            self.best_epoch = epoch
+            self.epochs_no_improve = 0
+            return True
+        
+        self.epochs_no_improve += 1
+        return False
+    
+    @property
+    def should_stop(self):
+        """True après `patience` validations consécutives sans amélioration."""
+        return self.epochs_no_improve >= self.patience
+
+
+def build_checkpoint(trainer, state, epoch):
+    """État complet nécessaire pour reprendre l'entraînement."""
+    return {
+        'epoch': epoch,
+        'generator_state_dict': trainer.generator.state_dict(),
+        'discriminator_state_dict': trainer.discriminator.state_dict(),
+        'optimizer_G_state_dict': trainer.optimizer_G.state_dict(),
+        'optimizer_D_state_dict': trainer.optimizer_D.state_dict(),
+        'scheduler_G_state_dict': trainer.scheduler_G.state_dict(),
+        'scheduler_D_state_dict': trainer.scheduler_D.state_dict(),
+        'history': state.history,
+        'best_val_loss': state.best_val_loss,
+        'best_val_psnr': state.best_val_psnr,
+        'best_val_ssim': state.best_val_ssim,
+        'best_epoch': state.best_epoch,
+        'epochs_no_improve': state.epochs_no_improve
+    }
+
+
+def restore_checkpoint(checkpoint, trainer, state):
+    """Restaure le trainer et l'état d'entraînement. Retourne l'époque de reprise."""
+    trainer.generator.load_state_dict(checkpoint['generator_state_dict'])
+    trainer.discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
+    trainer.optimizer_G.load_state_dict(checkpoint['optimizer_G_state_dict'])
+    trainer.optimizer_D.load_state_dict(checkpoint['optimizer_D_state_dict'])
+    start_epoch = checkpoint['epoch']
+    
+    if 'scheduler_G_state_dict' in checkpoint:
+        trainer.scheduler_G.load_state_dict(checkpoint['scheduler_G_state_dict'])
+        trainer.scheduler_D.load_state_dict(checkpoint['scheduler_D_state_dict'])
+    else:
+        # Ancien checkpoint, sauvé avant le step de l'époque: le LR courant vient
+        # de l'optimizer, on recale le compteur puis on rejoue ce step
+        trainer.scheduler_G.last_epoch = start_epoch - 1
+        trainer.scheduler_D.last_epoch = start_epoch - 1
+        trainer.step_schedulers()
+    
+    state.history = checkpoint.get('history', [])
+    state.best_val_loss = checkpoint.get('best_val_loss', state.best_val_loss)
+    state.best_val_psnr = checkpoint.get('best_val_psnr', state.best_val_psnr)
+    state.best_val_ssim = checkpoint.get('best_val_ssim', state.best_val_ssim)
+    state.best_epoch = checkpoint.get('best_epoch', state.best_epoch)
+    state.epochs_no_improve = checkpoint.get('epochs_no_improve', state.epochs_no_improve)
+    return start_epoch
 
 
 def main():
@@ -398,14 +469,16 @@ def main():
     parser.add_argument('--save_every', type=int, default=25,
                        help='Sauvegarder tous les N epochs')
     parser.add_argument('--patience', type=int, default=20,
-                       help='Patience pour early stopping')
+                       help='Patience pour early stopping (en nombre de validations)')
     parser.add_argument('--val_every', type=int, default=5,
                        help='Valider tous les N epochs')
+    parser.add_argument('--num_workers', type=int, default=4,
+                       help='Nombre de workers pour le chargement des données')
     
     args = parser.parse_args()
     
     # Configuration
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = get_device()
     print(f"Device: {device}")
     print(f"Image size: {args.image_size}x{args.image_size}")
     print(f"Batch size: {args.batch_size}")
@@ -458,16 +531,16 @@ def main():
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=4,
-        pin_memory=True
+        num_workers=args.num_workers,
+        pin_memory=device.type == 'cuda'
     )
     
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=4,
-        pin_memory=True
+        num_workers=args.num_workers,
+        pin_memory=device.type == 'cuda'
     )
     
     print(f"Train dataset size: {len(train_dataset)} échantillons")
@@ -490,61 +563,15 @@ def main():
         use_wandb=use_wandb
     )
     
-    # Liste pour stocker les losses par époque
-    epoch_losses_history = []
-    
-    # Pour early stopping et best model
-    best_val_loss = float('inf')
-    best_val_psnr = 0
-    best_val_ssim = 0
-    best_epoch = 0
-    epochs_no_improve = 0
+    # Historique, meilleur modèle et early stopping
+    state = TrainingState(patience=args.patience)
     
     # Charger checkpoint si spécifié
     start_epoch = 0
     if args.checkpoint:
         checkpoint = torch.load(args.checkpoint, map_location=device)
-        generator.load_state_dict(checkpoint['generator_state_dict'])
-        discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
-        trainer.optimizer_G.load_state_dict(checkpoint['optimizer_G_state_dict'])
-        trainer.optimizer_D.load_state_dict(checkpoint['optimizer_D_state_dict'])
-        start_epoch = checkpoint['epoch']
-        
-        if 'scheduler_G_state_dict' in checkpoint:
-            trainer.scheduler_G.load_state_dict(checkpoint['scheduler_G_state_dict'])
-            trainer.scheduler_D.load_state_dict(checkpoint['scheduler_D_state_dict'])
-        else:
-            # Ancien checkpoint, sauvé avant le step de l'époque: le LR courant vient
-            # de l'optimizer, on recale le compteur puis on rejoue ce step
-            trainer.scheduler_G.last_epoch = start_epoch - 1
-            trainer.scheduler_D.last_epoch = start_epoch - 1
-            trainer.step_schedulers()
-        
-        epoch_losses_history = checkpoint.get('history', [])
-        best_val_loss = checkpoint.get('best_val_loss', best_val_loss)
-        best_val_psnr = checkpoint.get('best_val_psnr', best_val_psnr)
-        best_val_ssim = checkpoint.get('best_val_ssim', best_val_ssim)
-        best_epoch = checkpoint.get('best_epoch', best_epoch)
-        epochs_no_improve = checkpoint.get('epochs_no_improve', epochs_no_improve)
+        start_epoch = restore_checkpoint(checkpoint, trainer, state)
         print(f"Checkpoint chargé: epoch {start_epoch}")
-    
-    def make_checkpoint(epoch):
-        """État complet nécessaire pour reprendre l'entraînement."""
-        return {
-            'epoch': epoch,
-            'generator_state_dict': generator.state_dict(),
-            'discriminator_state_dict': discriminator.state_dict(),
-            'optimizer_G_state_dict': trainer.optimizer_G.state_dict(),
-            'optimizer_D_state_dict': trainer.optimizer_D.state_dict(),
-            'scheduler_G_state_dict': trainer.scheduler_G.state_dict(),
-            'scheduler_D_state_dict': trainer.scheduler_D.state_dict(),
-            'history': epoch_losses_history,
-            'best_val_loss': best_val_loss,
-            'best_val_psnr': best_val_psnr,
-            'best_val_ssim': best_val_ssim,
-            'best_epoch': best_epoch,
-            'epochs_no_improve': epochs_no_improve
-        }
     
     # Entraînement
     print("Début de l'entraînement amélioré...")
@@ -601,21 +628,12 @@ def main():
             print(f"  Val SSIM: {val_metrics['val_ssim']:.4f}")
             
             # Vérifier si c'est le meilleur modèle
-            if val_metrics['val_psnr'] > best_val_psnr:
-                best_val_psnr = val_metrics['val_psnr']
-                best_val_ssim = val_metrics['val_ssim']
-                best_val_loss = val_metrics['val_loss_G']
-                best_epoch = epoch + 1
-                epochs_no_improve = 0
-                
-                save_best = True
-            else:
-                epochs_no_improve += 1
-                
+            save_best = state.update(epoch + 1, val_metrics)
+            
             # Early stopping (la boucle s'arrête en fin d'époque, après les sauvegardes)
-            if epochs_no_improve >= args.patience:
+            if state.should_stop:
                 print(f"\n\u26a0️  Early stopping: pas d'amélioration depuis {args.patience} validations")
-                print(f"Meilleur modèle: epoch {best_epoch} (PSNR: {best_val_psnr:.2f}, SSIM: {best_val_ssim:.4f})")
+                print(f"Meilleur modèle: epoch {state.best_epoch} (PSNR: {state.best_val_psnr:.2f}, SSIM: {state.best_val_ssim:.4f})")
                 early_stop = True
         
         # Sauvegarder les losses de cette époque
@@ -633,7 +651,7 @@ def main():
         if val_metrics:
             epoch_loss_data.update(val_metrics)
             
-        epoch_losses_history.append(epoch_loss_data)
+        state.history.append(epoch_loss_data)
         
         print(f"\nEpoch {epoch+1}/{args.num_epochs}:")
         print(f"  Generator Loss: {avg_losses['loss_G']:.4f}")
@@ -641,8 +659,8 @@ def main():
         print(f"  L1 Loss: {avg_losses['loss_G_L1']:.4f}")
         print(f"  LR G: {trainer.scheduler_G.get_last_lr()[0]:.6f}")
         
-        if best_epoch > 0:
-            print(f"  Best model: epoch {best_epoch} (PSNR: {best_val_psnr:.2f} dB, SSIM: {best_val_ssim:.4f})")
+        if state.best_epoch > 0:
+            print(f"  Best model: epoch {state.best_epoch} (PSNR: {state.best_val_psnr:.2f} dB, SSIM: {state.best_val_ssim:.4f})")
         
         # Sauvegarder des échantillons
         if (epoch + 1) % 5 == 0:
@@ -653,18 +671,18 @@ def main():
         
         # Sauvegarder le meilleur modèle
         if save_best:
-            best_checkpoint = make_checkpoint(epoch + 1)
+            best_checkpoint = build_checkpoint(trainer, state, epoch + 1)
             best_checkpoint.update({
-                'val_psnr': best_val_psnr,
-                'val_ssim': best_val_ssim,
-                'val_loss': best_val_loss
+                'val_psnr': state.best_val_psnr,
+                'val_ssim': state.best_val_ssim,
+                'val_loss': state.best_val_loss
             })
             torch.save(best_checkpoint, 'checkpoints/best_model.pth')
-            print(f"\u2705 Nouveau meilleur modèle sauvegardé (PSNR: {best_val_psnr:.2f})")
+            print(f"\u2705 Nouveau meilleur modèle sauvegardé (PSNR: {state.best_val_psnr:.2f})")
         
         # Sauvegarder checkpoint
         if (epoch + 1) % args.save_every == 0:
-            checkpoint = make_checkpoint(epoch + 1)
+            checkpoint = build_checkpoint(trainer, state, epoch + 1)
             checkpoint['losses'] = avg_losses
             torch.save(checkpoint, f'checkpoints/improved_checkpoint_epoch_{epoch+1}.pth')
             print(f"Checkpoint sauvé: improved_checkpoint_epoch_{epoch+1}.pth")
@@ -683,18 +701,18 @@ def main():
         # Sauvegarder les losses dans un fichier JSON (toutes les 10 époques)
         if (epoch + 1) % 10 == 0 or epoch == args.num_epochs - 1 or early_stop:
             with open('logs/training_losses.json', 'w') as f:
-                json.dump(epoch_losses_history, f, indent=2)
+                json.dump(state.history, f, indent=2)
             print("Losses sauvegardées dans logs/training_losses.json")
         
         if early_stop:
             break
     
     print("\nEntraînement terminé!")
-    if best_epoch > 0:
-        print(f"\u2705 Meilleur modèle: epoch {best_epoch}")
-        print(f"   - PSNR: {best_val_psnr:.2f} dB")
-        print(f"   - SSIM: {best_val_ssim:.4f}")
-        print(f"   - Val Loss: {best_val_loss:.4f}")
+    if state.best_epoch > 0:
+        print(f"\u2705 Meilleur modèle: epoch {state.best_epoch}")
+        print(f"   - PSNR: {state.best_val_psnr:.2f} dB")
+        print(f"   - SSIM: {state.best_val_ssim:.4f}")
+        print(f"   - Val Loss: {state.best_val_loss:.4f}")
         print("   Sauvegardé dans: checkpoints/best_model.pth")
     
     # Générer les graphiques de losses à la fin de l'entraînement

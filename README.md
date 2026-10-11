@@ -58,9 +58,13 @@ python -m core.training.improved_training --image_size 256 --batch_size 16
 | `--lambda_l1` | 100 | Poids de la loss L1 |
 | `--val_every` | 5 | Valider toutes les N époques |
 | `--patience` | 20 | Early stopping après N validations sans amélioration du PSNR |
+| `--num_workers` | 4 | Nombre de workers pour le chargement des données |
 | `--save_every` | 25 | Sauvegarder un checkpoint toutes les N époques |
 | `--checkpoint` | — | Reprendre l'entraînement depuis un checkpoint |
 | `--use_wandb` | — | Activer le suivi Weights & Biases |
+
+Le calcul utilise le GPU s'il y en a un (CUDA, ou MPS sur Mac Apple Silicon),
+sinon le CPU.
 
 Les sorties sont écrites dans le répertoire courant :
 
@@ -110,7 +114,8 @@ python -m core.generation.generate_multiple_environments \
 
 L'architecture (256 ou 512) est détectée à partir du checkpoint, et la carte
 d'entrée est redimensionnée en conséquence. Un checkpoint introuvable ou
-incompatible provoque une erreur.
+incompatible, ou une carte d'entrée introuvable, provoque une erreur. Sans
+`--input_map`, `generate_image` génère une carte aléatoire.
 
 ## Tests
 

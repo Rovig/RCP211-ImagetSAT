@@ -4,11 +4,12 @@ Script pour générer des images satellites à partir de cartes binaires
 Version refactorisée avec principes SOLID et KISS
 """
 
-import torch
 import argparse
+from pathlib import Path
 
 from core.generation.satellite_generator import SimpleSatelliteGenerator
 from utils.unified_upscaler import SimpleImageUpscaler
+from utils.device import get_device
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -34,7 +35,7 @@ def main_simple():
     args = parser.parse_args()
     
     logger.info(f"Génération d'image satellite (environnement: {args.environment})")
-    logger.info(f"Device: {torch.device('cuda' if torch.cuda.is_available() else 'cpu')}")
+    logger.info(f"Device: {get_device()}")
     
     # Utilisation simple en une ligne
     generator = SimpleSatelliteGenerator(args.checkpoint)
@@ -48,9 +49,10 @@ def main_simple():
         upscaler = SimpleImageUpscaler()
         
         # Création du nom de fichier upscalé
-        base_name = output_file.rsplit('.', 1)[0]
-        extension = output_file.rsplit('.', 1)[1]
-        upscaled_output = f"{base_name}_upscaled_{args.upscale}x.{extension}"
+        output_path = Path(output_file)
+        upscaled_output = str(output_path.with_name(
+            f"{output_path.stem}_upscaled_{args.upscale}x{output_path.suffix}"
+        ))
         
         upscaled_file = upscaler.upscale_image(
             output_file, 

@@ -2,6 +2,7 @@
 Système de logging centralisé pour le projet RCP211-ImagetSAT
 """
 
+import copy
 import logging
 import sys
 from pathlib import Path
@@ -22,6 +23,8 @@ class ColoredFormatter(logging.Formatter):
     RESET = '\033[0m'
     
     def format(self, record):
+        # Copie: le record est partagé avec les autres handlers (fichier)
+        record = copy.copy(record)
         log_color = self.COLORS.get(record.levelname, self.RESET)
         record.levelname = f"{log_color}{record.levelname}{self.RESET}"
         return super().format(record)

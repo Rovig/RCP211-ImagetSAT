@@ -13,6 +13,7 @@ from pathlib import Path
 
 from core.training.improved_training import (
     ImprovedInriaDataset, ImprovedTrainer, ImprovedGenerator, ImprovedDiscriminator,
+    TrainingState, build_checkpoint, restore_checkpoint,
     calculate_psnr, calculate_ssim
 )
 
@@ -199,7 +200,11 @@ class TestMetrics(unittest.TestCase):
         """Test du PSNR sur deux images identiques"""
         img = torch.rand(1, 3, 64, 64)
         
-        self.assertEqual(calculate_psnr(img, img), float('inf'))
+        psnr = calculate_psnr(img, img)
+        
+        # Un tensor, comme dans le cas général (la validation appelle .item())
+        self.assertIsInstance(psnr, torch.Tensor)
+        self.assertEqual(psnr.item(), float('inf'))
     
     def test_psnr_known_value(self):
         """Test du PSNR sur une erreur connue"""
@@ -303,6 +308,20 @@ class TestImprovedTrainer(unittest.TestCase):
         self.assertTrue(self.generator.training)
         self.assertTrue(self.discriminator.training)
     
+    def test_validate_with_empty_loader(self):
+        """Test que la validation sans données est une erreur explicite"""
+        with self.assertRaises(ValueError):
+            self.trainer.validate([])
+        
+        self.assertTrue(self.generator.training)
+    
+    def test_train_step_with_single_sample(self):
+        """Test d'une étape d'entraînement avec un batch de taille 1"""
+        losses = self.trainer.train_step(self.real_A[:1], self.real_B[:1])
+        
+        for value in losses.values():
+            self.assertTrue(math.isfinite(value))
+    
     def test_validate_does_not_update_weights(self):
         """Test que la validation ne modifie pas les poids"""
         g_before = [p.clone() for p in self.generator.parameters()]
@@ -352,6 +371,205 @@ class TestImprovedTrainer(unittest.TestCase):
         
         self.assertEqual(other.scheduler_G.last_epoch, 60)
         self.assertEqual(other.scheduler_G.get_last_lr(), self.trainer.scheduler_G.get_last_lr())
+
+
+def val_metrics(psnr, ssim=0.5, loss=10.0):
+    """Métriques de validation au format renvoyé par ImprovedTrainer.validate"""
+    return {'val_loss_G': loss, 'val_loss_D': 0.5, 'val_psnr': psnr, 'val_ssim': ssim}
+
+
+class TestTrainingState(unittest.TestCase):
+    """Tests pour le suivi du meilleur modèle et l'early stopping"""
+    
+    def test_initial_state(self):
+        """Test de l'état initial"""
+        state = TrainingState(patience=3)
+        
+        self.assertEqual(state.history, [])
+        self.assertEqual(state.best_epoch, 0)
+        self.assertEqual(state.epochs_no_improve, 0)
+        self.assertFalse(state.should_stop)
+    
+    def test_improvement_becomes_best_model(self):
+        """Test qu'un meilleur PSNR devient le meilleur modèle"""
+        state = TrainingState(patience=3)
+        
+        self.assertTrue(state.update(5, val_metrics(psnr=12.0, ssim=0.3, loss=40.0)))
+        
+        self.assertEqual(state.best_epoch, 5)
+        self.assertEqual(state.best_val_psnr, 12.0)
+        self.assertEqual(state.best_val_ssim, 0.3)
+        self.assertEqual(state.best_val_loss, 40.0)
+        
+        self.assertTrue(state.update(10, val_metrics(psnr=14.0)))
+        self.assertEqual(state.best_epoch, 10)
+    
+    def test_no_improvement_keeps_best_model(self):
+        """Test qu'un PSNR égal ou inférieur ne remplace pas le meilleur modèle"""
+        state = TrainingState(patience=3)
+        state.update(5, val_metrics(psnr=12.0))
+        
+        self.assertFalse(state.update(10, val_metrics(psnr=12.0)))
+        self.assertFalse(state.update(15, val_metrics(psnr=11.0)))
+        
+        self.assertEqual(state.best_epoch, 5)
+        self.assertEqual(state.best_val_psnr, 12.0)
+        self.assertEqual(state.epochs_no_improve, 2)
+    
+    def test_early_stopping_after_patience_validations(self):
+        """Test de l'arrêt après `patience` validations sans amélioration"""
+        state = TrainingState(patience=3)
+        state.update(5, val_metrics(psnr=12.0))
+        
+        for epoch in (10, 15):
+            state.update(epoch, val_metrics(psnr=11.0))
+            self.assertFalse(state.should_stop)
+        
+        state.update(20, val_metrics(psnr=11.0))
+        self.assertTrue(state.should_stop)
+    
+    def test_improvement_resets_patience(self):
+        """Test qu'une amélioration remet le compteur à zéro"""
+        state = TrainingState(patience=2)
+        state.update(5, val_metrics(psnr=12.0))
+        state.update(10, val_metrics(psnr=11.0))
+        
+        state.update(15, val_metrics(psnr=13.0))
+        
+        self.assertEqual(state.epochs_no_improve, 0)
+        self.assertFalse(state.should_stop)
+
+
+class TestCheckpointResume(unittest.TestCase):
+    """Tests pour la sauvegarde et la reprise de l'entraînement"""
+    
+    def setUp(self):
+        """Configuration avant chaque test"""
+        torch.manual_seed(0)
+        self.device = torch.device('cpu')
+        self.trainer = self._new_trainer()
+        self.real_A = torch.rand(2, 3, 256, 256) * 2 - 1
+        self.real_B = torch.rand(2, 3, 256, 256) * 2 - 1
+    
+    def _new_trainer(self):
+        return ImprovedTrainer(ImprovedGenerator(ngf=8), ImprovedDiscriminator(ndf=8), self.device)
+    
+    def _train_epochs(self, trainer, num_epochs):
+        for _ in range(num_epochs):
+            trainer.train_step(self.real_A, self.real_B)
+            trainer.step_schedulers()
+    
+    def _roundtrip(self, checkpoint):
+        """Sauvegarde puis recharge comme le fait le script d'entraînement"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "checkpoint.pth"
+            torch.save(checkpoint, path)
+            return torch.load(path, map_location=self.device)
+    
+    def test_resume_restores_everything(self):
+        """Test que la reprise restaure modèles, optimizers, schedulers et état"""
+        self._train_epochs(self.trainer, 60)
+        state = TrainingState(patience=5)
+        state.history = [{'epoch': e + 1, 'loss_G': 1.0} for e in range(60)]
+        state.update(55, val_metrics(psnr=12.0, ssim=0.3, loss=40.0))
+        state.update(60, val_metrics(psnr=11.0))
+        
+        checkpoint = self._roundtrip(build_checkpoint(self.trainer, state, 60))
+        
+        resumed = self._new_trainer()
+        resumed_state = TrainingState(patience=5)
+        start_epoch = restore_checkpoint(checkpoint, resumed, resumed_state)
+        
+        self.assertEqual(start_epoch, 60)
+        
+        # Poids
+        for name, param in self.trainer.generator.state_dict().items():
+            self.assertTrue(torch.equal(param, resumed.generator.state_dict()[name]))
+        for name, param in self.trainer.discriminator.state_dict().items():
+            self.assertTrue(torch.equal(param, resumed.discriminator.state_dict()[name]))
+        
+        # Learning rate (divisé par 2 après 50 époques) et position des schedulers
+        self.assertAlmostEqual(resumed.optimizer_G.param_groups[0]['lr'], 0.0001)
+        self.assertAlmostEqual(resumed.optimizer_D.param_groups[0]['lr'], 0.0001)
+        self.assertEqual(resumed.scheduler_G.last_epoch, 60)
+        self.assertEqual(resumed.scheduler_D.last_epoch, 60)
+        
+        # Historique, meilleur modèle et compteur d'early stopping
+        self.assertEqual(resumed_state.history, state.history)
+        self.assertEqual(resumed_state.best_epoch, 55)
+        self.assertEqual(resumed_state.best_val_psnr, 12.0)
+        self.assertEqual(resumed_state.best_val_ssim, 0.3)
+        self.assertEqual(resumed_state.best_val_loss, 40.0)
+        self.assertEqual(resumed_state.epochs_no_improve, 1)
+    
+    def test_resumed_training_matches_uninterrupted_training(self):
+        """Test que le LR suit le même calendrier avec ou sans interruption"""
+        self._train_epochs(self.trainer, 40)
+        checkpoint = self._roundtrip(build_checkpoint(self.trainer, TrainingState(patience=5), 40))
+        
+        resumed = self._new_trainer()
+        restore_checkpoint(checkpoint, resumed, TrainingState(patience=5))
+        
+        self._train_epochs(self.trainer, 15)
+        self._train_epochs(resumed, 15)
+        
+        self.assertAlmostEqual(self.trainer.optimizer_G.param_groups[0]['lr'], 0.0001)
+        self.assertEqual(resumed.optimizer_G.param_groups[0]['lr'],
+                         self.trainer.optimizer_G.param_groups[0]['lr'])
+    
+    def _old_format_checkpoint(self, trainer, epoch):
+        """Checkpoint au format d'avant: sauvé avant le step des schedulers, sans leur état"""
+        return {
+            'epoch': epoch,
+            'generator_state_dict': trainer.generator.state_dict(),
+            'discriminator_state_dict': trainer.discriminator.state_dict(),
+            'optimizer_G_state_dict': trainer.optimizer_G.state_dict(),
+            'optimizer_D_state_dict': trainer.optimizer_D.state_dict(),
+            'losses': {'loss_G': 1.0}
+        }
+    
+    def test_resume_from_old_format_checkpoint(self):
+        """Test de reprise depuis un checkpoint sans état de scheduler"""
+        self._train_epochs(self.trainer, 24)
+        self.trainer.train_step(self.real_A, self.real_B)
+        checkpoint = self._roundtrip(self._old_format_checkpoint(self.trainer, 25))
+        
+        resumed = self._new_trainer()
+        state = TrainingState(patience=5)
+        start_epoch = restore_checkpoint(checkpoint, resumed, state)
+        
+        self.assertEqual(start_epoch, 25)
+        self.assertEqual(resumed.scheduler_G.last_epoch, 25)
+        self.assertAlmostEqual(resumed.optimizer_G.param_groups[0]['lr'], 0.0002)
+        self.assertEqual(state.history, [])
+        self.assertEqual(state.best_epoch, 0)
+        
+        # La division par 2 arrive bien à l'époque 50, pas 50 époques après la reprise
+        self._train_epochs(resumed, 25)
+        self.assertAlmostEqual(resumed.optimizer_G.param_groups[0]['lr'], 0.0001)
+    
+    def test_resume_from_old_format_checkpoint_at_decay_epoch(self):
+        """Test de reprise d'un ancien checkpoint sauvé juste avant une division du LR"""
+        self._train_epochs(self.trainer, 49)
+        self.trainer.train_step(self.real_A, self.real_B)
+        checkpoint = self._roundtrip(self._old_format_checkpoint(self.trainer, 50))
+        
+        resumed = self._new_trainer()
+        restore_checkpoint(checkpoint, resumed, TrainingState(patience=5))
+        
+        self.assertEqual(resumed.scheduler_G.last_epoch, 50)
+        self.assertAlmostEqual(resumed.optimizer_G.param_groups[0]['lr'], 0.0001)
+        self.assertAlmostEqual(resumed.optimizer_D.param_groups[0]['lr'], 0.0001)
+    
+    def test_mismatched_architecture_is_an_error(self):
+        """Test qu'un checkpoint d'une autre architecture est refusé"""
+        checkpoint = build_checkpoint(self.trainer, TrainingState(patience=5), 10)
+        
+        other = ImprovedTrainer(ImprovedGenerator(ngf=8, image_size=512),
+                                ImprovedDiscriminator(ndf=8, image_size=512), self.device)
+        
+        with self.assertRaises(RuntimeError):
+            restore_checkpoint(checkpoint, other, TrainingState(patience=5))
 
 
 if __name__ == '__main__':

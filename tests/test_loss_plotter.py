@@ -5,6 +5,7 @@ Tests unitaires pour le module loss_plotter
 
 import unittest
 import json
+import os
 import tempfile
 from pathlib import Path
 
@@ -96,6 +97,20 @@ class TestLossPlotter(unittest.TestCase):
         self.assertTrue(plotter.plot_main_losses(str(save_path)))
         self.assertTrue(save_path.exists())
         self.assertGreater(save_path.stat().st_size, 0)
+    
+    def test_plot_main_losses_bare_filename(self):
+        """Test avec un chemin de sauvegarde sans répertoire"""
+        self._write_log(make_losses(10))
+        plotter = LossPlotter(str(self.log_file))
+        plotter.load_losses()
+        
+        previous_cwd = os.getcwd()
+        os.chdir(self.temp_dir)
+        try:
+            self.assertTrue(plotter.plot_main_losses("losses.png"))
+            self.assertTrue(Path("losses.png").exists())
+        finally:
+            os.chdir(previous_cwd)
     
     def test_plot_main_losses_few_epochs(self):
         """Test avec trop peu d'époques pour la moyenne mobile"""

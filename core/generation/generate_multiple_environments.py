@@ -9,6 +9,7 @@ from pathlib import Path
 
 from core.models.model_manager import OriginalGenerator, GeneratorLoader
 from core.generation.environment_styles import EnvironmentStyler
+from utils.device import get_device
 import torch
 from PIL import Image
 import torchvision.transforms as transforms
@@ -59,7 +60,7 @@ def main():
     output_dir.mkdir(exist_ok=True)
     
     # Charger le modèle
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = get_device()
     print(f"Device: {device}")
     
     loader = GeneratorLoader(OriginalGenerator)

@@ -135,7 +135,9 @@ class LossPlotter:
         plt.tight_layout()
         
         # Sauvegarder
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        save_dir = os.path.dirname(save_path)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         print(f"📊 Graphique sauvegardé: {save_path}")
         
