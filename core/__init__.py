@@ -1,0 +1,1 @@
+"""Core package for RCP211-ImagetSAT project"""

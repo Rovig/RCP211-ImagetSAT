@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rcp211-imagetsat"
+version = "0.1.0"
+description = "Génération d'images satellites à partir de cartes binaires (Pix2Pix, dataset Inria)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=1.13",
+    "torchvision",
+    "Pillow>=9.1",
+    "numpy",
+    "matplotlib",
+    "scikit-learn",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+wandb = ["wandb"]
+
+[tool.setuptools.packages.find]
+include = ["core*", "utils*"]
